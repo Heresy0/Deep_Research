@@ -1,268 +1,240 @@
 import asyncio
-from threading import Lock, Thread
-from typing import AsyncIterator, Callable
+import hashlib
+import json
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from threading import BoundedSemaphore, Lock
+from typing import AsyncIterator
+from uuid import uuid4
 
 from mult_agents.config import AppConfig
 from mult_agents.graph import build_app as build_workflow_app
 from mult_agents.main import build_agents, build_checkpointer, build_memory_manager
+from mult_agents.prompts import PROMPTS
 from mult_agents.state import create_initial_state
+from mult_agents.harness.runtime import RunContext, Limits, ExecutionError, activate, register, unregister
+from mult_agents.harness.validation import render_report
+from mult_agents.harness.telemetry import METRICS
+from .run_store import PostgresRunStore
+
+logger = logging.getLogger("backend.workflow")
+
+
+class CapacityExceeded(RuntimeError):
+    pass
 
 
 class WorkflowService:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path, *, store=None, workflow=None, config=None, max_concurrency=None):
         self._config_path = config_path
-        self._lock = Lock()
-        self._initialized = False
-        self._base_config: AppConfig | None = None
+        self._lock, self._store_lock = Lock(), Lock()
+        self._initialized = workflow is not None
+        self._base_config = config
         self._memory_manager = None
-        self._app = None
+        self._app = workflow
+        self._store = store
+        self._store_started = False
+        self._admission_lock = Lock()
+        self._closed = False
+        self._checkpointer_context = None
+        self._limits = Limits.from_env()
+        capacity = max_concurrency or max(1, min(4, int(os.getenv("RESEARCH_MAX_CONCURRENCY", 2))))
+        self._capacity = BoundedSemaphore(capacity)
+        self._executor = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="research")
 
-    def _ensure_initialized(self) -> None:
+    def start(self):
+        with self._store_lock:
+            if self._store_started:
+                return
+            if self._base_config is None:
+                self._base_config = AppConfig.from_file(self._config_path)
+            if self._store is None:
+                self._store = PostgresRunStore(self._base_config.postgres_dsn)
+            count = self._store.fail_interrupted()
+            if count:
+                logger.warning("interrupted_runs_marked_failed | count=%d", count)
+            self._store_started = True
+
+    def close(self):
+        with self._admission_lock:
+            self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._checkpointer_context:
+            self._checkpointer_context.__exit__(None, None, None)
+            self._checkpointer_context = None
+        if self._store:
+            self._store.close()
+
+    def _ensure_initialized(self):
         if self._initialized:
             return
         with self._lock:
             if self._initialized:
                 return
-            base_config = AppConfig.from_file(self._config_path)
-            self._memory_manager = build_memory_manager(base_config)
-            agents = build_agents(base_config.model, base_config.api_key, base_config)
-            checkpointer = build_checkpointer(base_config)
-            self._app = build_workflow_app(agents, checkpointer)
-            self._base_config = base_config
+            config = self._base_config or AppConfig.from_file(self._config_path)
+            self._base_config = config
+            self._memory_manager = build_memory_manager(config)
+            agents = build_agents(config.model, config.api_key, config)
+            self._app = build_workflow_app(agents, build_checkpointer(config))
+            from mult_agents import main as workflow_main
+            self._checkpointer_context = workflow_main.CHECKPOINTER_CONTEXT
             self._initialized = True
 
-    def _build_runtime_config(
-        self,
-        user_id: str,
-        thread_id: str,
-        tenant_id: str,
-        max_iterations: int | None,
-        enable_memory: bool | None,
-    ) -> AppConfig:
-        if self._base_config is None:
-            raise RuntimeError("service not initialized")
-        overrides = {
-            "user_id": user_id,
-            "thread_id": thread_id,
-            "tenant_id": tenant_id,
-            "max_iterations": max_iterations if max_iterations is not None else self._base_config.max_iterations,
-        }
-        if enable_memory is not None:
-            overrides["enable_memory"] = enable_memory
-        return self._base_config.with_overrides(**overrides)
+    def start_run(self, request):
+        with self._admission_lock:
+            if self._closed:
+                raise CapacityExceeded("研究服务正在关闭，请稍后重试。")
+            return self._admit(request)
 
-    def _run_sync(
-        self,
-        query: str,
-        user_id: str,
-        thread_id: str,
-        tenant_id: str,
-        max_iterations: int | None,
-        enable_memory: bool | None,
-    ) -> tuple[str, str]:
-        self._ensure_initialized()
-        runtime_config = self._build_runtime_config(
-            user_id=user_id,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            max_iterations=max_iterations,
-            enable_memory=enable_memory,
-        )
-        memory_context = ""
-        if self._memory_manager and runtime_config.enable_memory:
-            memory_context = self._memory_manager.build_personalized_prompt_context(
-                user_id=runtime_config.user_id,
-                thread_id=runtime_config.thread_id,
-                query=query,
-                tenant_id=runtime_config.tenant_id,
-                max_memories=runtime_config.memory_top_k,
-            )
-        state = create_initial_state(
-            query=query,
-            max_iterations=runtime_config.max_iterations,
-            user_id=runtime_config.user_id,
-            tenant_id=runtime_config.tenant_id,
-            memory_context=memory_context,
-        )
-        result = self._app.invoke(
-            state,
-            {"configurable": {"thread_id": runtime_config.thread_id}},
-        )
-        final = result.get("final", "")
-        route = str(result.get("intent", "multiagent"))
-        if self._memory_manager and runtime_config.enable_memory:
-            self._memory_manager.persist_turn(
-                tenant_id=runtime_config.tenant_id,
-                user_id=runtime_config.user_id,
-                thread_id=runtime_config.thread_id,
-                query=query,
-                answer=final,
-            )
-        return final, route
+    def _admit(self, request):
+        self.start()
+        if not self._capacity.acquire(blocking=False):
+            raise CapacityExceeded("研究服务繁忙，请等待正在运行的研究完成后重试。")
+        run_id = str(uuid4())
+        active = False
+        try:
+            from mult_agents.nodes import SUPPORT_PROMPT
+            from mult_agents.harness.validation import SCHEMAS
+            contracts = {name: schema.model_json_schema() for name, schema in SCHEMAS.items() if schema}
+            prompt_version = hashlib.sha256(json.dumps([PROMPTS, SUPPORT_PROMPT, contracts], sort_keys=True,
+                                                        ensure_ascii=False).encode()).hexdigest()[:12]
+            self._store.create(run_id, request, {"model": self._base_config.model, "prompt_version": prompt_version,
+                                                "workflow_version": "harness-v1", "limits": self._limits.__dict__,
+                                                "memory_enabled": bool(request.get("enable_memory", False))})
+            self._store.append(run_id, {"type": "status", "message": "研究已接收", "status": "running"})
+            with METRICS.lock:
+                METRICS.active += 1
+                active = True
+            self._executor.submit(self._execute, run_id, request)
+        except Exception:
+            if active:
+                with METRICS.lock:
+                    METRICS.active -= 1
+                try:
+                    self._store.finish(run_id, {"run_id": run_id, "status": "failed", "final": "研究未能启动。",
+                                                "run_summary": {"termination_reason": "INTERNAL_ERROR"}, "sources": []})
+                except Exception:
+                    logger.error("run_start_storage_failed | run_id=%s", run_id)
+            self._capacity.release()
+            raise
+        return run_id
 
-    @staticmethod
-    def _node_message(node_name: str) -> str:
-        mapping = {
-            "intent": "Intent Router 正在识别问题意图",
-            "direct_answer": "Direct Responder 正在快速作答",
-            "plan": "Planner 正在拆解问题",
-            "web_search": "Web Scout 正在检索网络证据",
-            "local_rag": "Local Scout 正在检索本地知识库",
-            "deep_dive": "Evidence Judge 正在进行证据裁判",
-            "analyze": "Analyst 正在生成结论",
-            "reflect": "Reflect 正在生成补搜计划",
-            "write": "Writer 正在撰写最终报告",
-        }
-        return mapping.get(node_name, f"{node_name} 正在执行")
-
-    def _run_sync_with_events(
-        self,
-        query: str,
-        user_id: str,
-        thread_id: str,
-        tenant_id: str,
-        max_iterations: int | None,
-        enable_memory: bool | None,
-        emit: Callable[[dict], None],
-    ) -> tuple[str, str]:
-        self._ensure_initialized()
-        runtime_config = self._build_runtime_config(
-            user_id=user_id,
-            thread_id=thread_id,
-            tenant_id=tenant_id,
-            max_iterations=max_iterations,
-            enable_memory=enable_memory,
-        )
-        memory_context = ""
-        if self._memory_manager and runtime_config.enable_memory:
-            memory_context = self._memory_manager.build_personalized_prompt_context(
-                user_id=runtime_config.user_id,
-                thread_id=runtime_config.thread_id,
-                query=query,
-                tenant_id=runtime_config.tenant_id,
-                max_memories=runtime_config.memory_top_k,
-            )
-        state = create_initial_state(
-            query=query,
-            max_iterations=runtime_config.max_iterations,
-            user_id=runtime_config.user_id,
-            tenant_id=runtime_config.tenant_id,
-            memory_context=memory_context,
-        )
-        final = ""
-        route = "multiagent"
-        config = {"configurable": {"thread_id": runtime_config.thread_id}}
-        for update in self._app.stream(state, config, stream_mode="updates"):
-            if not isinstance(update, dict):
-                continue
-            for node_name, node_output in update.items():
-                emit({"type": "phase", "node": node_name, "message": self._node_message(str(node_name))})
-                if isinstance(node_output, dict):
-                    if node_name == "intent":
-                        detected = str(node_output.get("intent", route)).strip().lower()
-                        if detected in {"direct", "multiagent"}:
-                            route = detected
-                    value = node_output.get("final")
-                    if value:
-                        final = str(value)
-        if not final:
-            result = self._app.invoke(state, config)
-            final = str(result.get("final", ""))
-            route = str(result.get("intent", route)).strip().lower()
-        if self._memory_manager and runtime_config.enable_memory:
-            self._memory_manager.persist_turn(
-                tenant_id=runtime_config.tenant_id,
-                user_id=runtime_config.user_id,
-                thread_id=runtime_config.thread_id,
-                query=query,
-                answer=final,
-            )
-        return final, route
-
-    async def run(
-        self,
-        query: str,
-        user_id: str,
-        thread_id: str,
-        tenant_id: str,
-        max_iterations: int | None,
-        enable_memory: bool | None,
-    ) -> str:
-        final, _ = await asyncio.to_thread(
-            self._run_sync,
-            query,
-            user_id,
-            thread_id,
-            tenant_id,
-            max_iterations,
-            enable_memory,
-        )
-        return final
-
-    async def run_with_route(
-        self,
-        query: str,
-        user_id: str,
-        thread_id: str,
-        tenant_id: str,
-        max_iterations: int | None,
-        enable_memory: bool | None,
-    ) -> tuple[str, str]:
-        return await asyncio.to_thread(
-            self._run_sync,
-            query,
-            user_id,
-            thread_id,
-            tenant_id,
-            max_iterations,
-            enable_memory,
-        )
-
-    async def stream_events(
-        self,
-        query: str,
-        user_id: str,
-        thread_id: str,
-        tenant_id: str,
-        max_iterations: int | None,
-        enable_memory: bool | None,
-    ) -> AsyncIterator[dict]:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-
-        def emit(event: dict) -> None:
-            asyncio.run_coroutine_threadsafe(queue.put(event), loop)
-
-        def worker() -> None:
+    def _execute(self, run_id, request):
+        context = RunContext(run_id, limits=self._limits, emit=lambda event: self._store.append(run_id, event))
+        register(context)
+        state = {}
+        with activate(context):
             try:
-                final, route = self._run_sync_with_events(
-                    query=query,
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    tenant_id=tenant_id,
-                    max_iterations=max_iterations,
-                    enable_memory=enable_memory,
-                    emit=emit,
-                )
-                emit({"type": "route", "message": "已走直接回答路径" if route == "direct" else "已走多智能体研究路径"})
-                emit(
-                    {
-                        "type": "final",
-                        "query": query,
-                        "user_id": user_id,
-                        "thread_id": thread_id,
-                        "tenant_id": tenant_id,
-                        "final": final,
-                    }
-                )
+                with context.span("run", "research"):
+                    self._ensure_initialized()
+                    config = self._base_config.with_overrides(
+                        user_id=request["user_id"], thread_id=request["thread_id"], tenant_id=request["tenant_id"],
+                        max_iterations=min(1, max(0, request.get("max_iterations") if request.get("max_iterations") is not None else self._base_config.max_iterations)),
+                        enable_memory=bool(request.get("enable_memory", False)))
+                    memory_context = ""
+                    if self._memory_manager and config.enable_memory:
+                        try:
+                            context.reserve("local")
+                            with context.span("tool", "memory_context"):
+                                memory_context = self._memory_manager.build_personalized_prompt_context(
+                                    user_id=config.user_id, thread_id=config.thread_id, query=request["query"], tenant_id=config.tenant_id,
+                                    max_memories=config.memory_top_k)[:3000]
+                        except Exception:
+                            context.error(ExecutionError("RAG_UNAVAILABLE", "memory"), "memory_context")
+                    state = create_initial_state(query=request["query"], max_iterations=config.max_iterations,
+                                                 user_id=config.user_id, tenant_id=config.tenant_id, memory_context=memory_context, run_id=run_id)
+                    graph_config = {"configurable": {"thread_id": run_id, "run_id": run_id}, "recursion_limit": 64}
+                    for update in self._app.stream(state, graph_config, stream_mode="updates"):
+                        for node, output in update.items():
+                            if not isinstance(output, dict):
+                                continue
+                            for key, value in output.items():
+                                state[key] = state.get(key, []) + value if key in {"messages", "retrieval_errors"} else value
+                            context.emit({"type": "phase", "node": node, "message": f"{node} 阶段已完成"})
+                    # Reading a checkpoint is safe; never invoke the initial state again.
+                    if not state.get("final") and hasattr(self._app, "get_state"):
+                        snapshot = self._app.get_state(graph_config)
+                        if snapshot and snapshot.values:
+                            state.update(snapshot.values)
+                    if not state.get("final"):
+                        raise ExecutionError("INTERNAL_ERROR")
+                    if self._memory_manager and config.enable_memory and state.get("status") != "failed":
+                        try:
+                            context.reserve("local", terminal=True)
+                            with context.span("tool", "memory_persist"):
+                                self._memory_manager.persist_turn(tenant_id=config.tenant_id, user_id=config.user_id,
+                                                                 thread_id=config.thread_id, query=request["query"], answer=state["final"])
+                        except Exception:
+                            context.error(ExecutionError("RAG_UNAVAILABLE", "memory"), "memory_persist")
             except Exception as exc:
-                emit({"type": "error", "message": str(exc)})
+                error = exc if isinstance(exc, ExecutionError) else ExecutionError("INTERNAL_ERROR")
+                logger.error("run_failed | run_id=%s exception_type=%s", run_id, type(exc).__name__)
+                context.error(error, "workflow")
+                state.update(status="partial" if state.get("verified_findings") else "failed", termination_reason=error.code,
+                             retrieval_errors=context.errors)
+                state["final"] = render_report(state, limited=True)
             finally:
-                emit({"type": "__done__"})
+                summary = context.summary()
+                summary["source_count"] = len(state.get("evidence_pool", []))
+                summary["verified_finding_count"] = len(state.get("verified_findings", []))
+                summary["termination_reason"] = state.get("termination_reason") or summary["termination_reason"]
+                from mult_agents.nodes import _extract_citation_ids
+                used = set(_extract_citation_ids(state.get("final", "")))
+                sources = [{k: e.get(k, "") for k in ("source_id", "title", "url", "doc_id", "snippet", "retrieval_level")}
+                           for e in state.get("evidence_pool", []) if e.get("source_id") in used]
+                result = {"run_id": run_id, **{k: request[k] for k in ("query", "user_id", "thread_id", "tenant_id")},
+                          "status": state.get("status", "failed"), "route": state.get("intent", "unknown"),
+                          "final": state.get("final", "研究执行失败。"), "run_summary": summary, "sources": sources}
+                try:
+                    self._store.finish(run_id, result)
+                    METRICS.finish_run(result["status"], summary)
+                except Exception:
+                    logger.error("run_finish_storage_failed | run_id=%s", run_id)
+                finally:
+                    unregister(run_id)
+                    with METRICS.lock:
+                        METRICS.active -= 1
+                    self._capacity.release()
 
-        Thread(target=worker, daemon=True).start()
+    def get_run(self, run_id):
+        self.start()
+        return self._store.get(run_id)
+
+    async def wait_result(self, run_id):
         while True:
-            event = await queue.get()
-            if event.get("type") == "__done__":
-                break
+            run = await asyncio.to_thread(self.get_run, run_id)
+            if not run:
+                raise KeyError(run_id)
+            if run["status"] != "running":
+                return run["result"]
+            await asyncio.sleep(.15)
+
+    async def events(self, run_id, after_seq=0) -> AsyncIterator[dict]:
+        while True:
+            batch = await asyncio.to_thread(self._store.events, run_id, after_seq, 100)
+            for event in batch:
+                after_seq = event["seq"]
+                yield event
+            run = await asyncio.to_thread(self.get_run, run_id)
+            if not run:
+                return
+            if run["status"] != "running" and len(batch) < 100:
+                # Re-read after status: terminal event may commit between the two reads.
+                tail = await asyncio.to_thread(self._store.events, run_id, after_seq, 100)
+                if not tail:
+                    return
+                for event in tail:
+                    after_seq = event["seq"]
+                    yield event
+            else:
+                await asyncio.sleep(.2)
+
+    async def run(self, **request):
+        run_id = await asyncio.to_thread(self.start_run, request)
+        return await self.wait_result(run_id)
+
+    async def stream_events(self, **request):
+        run_id = await asyncio.to_thread(self.start_run, request)
+        async for event in self.events(run_id):
             yield event

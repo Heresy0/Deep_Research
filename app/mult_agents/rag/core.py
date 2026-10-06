@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from langchain_community.embeddings import DashScopeEmbeddings
+from ..harness.embeddings import build_embeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import connections, utility
@@ -34,10 +34,7 @@ class RAGSystem:
     def __init__(self, api_key: str, config: Optional[RAGConfig] = None):
         self.config = config or RAGConfig()
         self.api_key = api_key
-        self.embeddings = DashScopeEmbeddings(
-            model=self.config.embedding_model,
-            dashscope_api_key=self.api_key,
-        )
+        self.embeddings = build_embeddings(self.config.embedding_model, self.api_key)
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap,
@@ -59,6 +56,7 @@ class RAGSystem:
                 alias="default",
                 host=self.config.milvus_host,
                 port=self.config.milvus_port,
+                timeout=10,
             )
         except Exception as exc:
             logger.error("连接 Milvus 失败: %s", exc)
@@ -80,7 +78,7 @@ class RAGSystem:
     def search_records(self, query: str, k: int = 5) -> list[dict]:
         if not utility.has_collection(self.config.collection_name):
             return []
-        docs = self.vectorstore.similarity_search(query, k=k)
+        docs = self.vectorstore.similarity_search(query, k=k, timeout=10)
         records: list[dict] = []
         for idx, doc in enumerate(docs, 1):
             metadata = doc.metadata or {}

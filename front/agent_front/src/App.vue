@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { nextTick, ref } from 'vue'
+import { nextTick, onMounted, ref } from 'vue'
 
-type StreamEvent = {
-  type: 'status' | 'phase' | 'route' | 'final' | 'error'
-  message?: string
-  final?: string
-  node?: string
+type RunSummary = {
+  model_calls?: number; web_calls?: number; tool_calls?: number; duration_ms?: number
+  termination_reason?: string; errors?: { code: string; provider: string; message: string }[]
+  token_usage?: { input_tokens: number; output_tokens: number; status: string }
 }
+type Source = { source_id: string; title: string; url?: string; doc_id?: string; snippet: string; retrieval_level?: string }
+type RunResult = { run_id: string; status: string; final: string; run_summary: RunSummary; sources: Source[] }
+type StreamEvent = Partial<RunResult> & {
+  type: string; seq?: number; message?: string; node?: string; kind?: string; name?: string
+}
+type SavedRun = { runId: string; query: string; seq: number; userId: string; threadId: string; tenantId: string }
 
 type ChatMessage = {
   id: string
@@ -23,6 +28,20 @@ const errorMessage = ref('')
 const messageListRef = ref<HTMLElement | null>(null)
 const composerRef = ref<HTMLTextAreaElement | null>(null)
 const progressLogs = ref<string[]>([])
+const runId = ref('')
+const runStatus = ref('')
+const runSummary = ref<RunSummary>({})
+const runSources = ref<Source[]>([])
+const enableMemory = ref(false)
+let activeRun: SavedRun | null = null
+const storageKey = 'deepresearch.latest-run'
+const statusLabels: Record<string, string> = { running: '执行中', completed: '已完成', partial: '有限结果', failed: '执行失败' }
+const nodeLabels: Record<string, string> = {
+  intent: '识别意图', direct_answer: '快速回答', plan: '规划问题', web_search: '网络取证', local_rag: '知识库取证',
+  deep_dive: '审计证据', analyze: '分析结论', reflect: '规划补搜', verify: '检查证据支持', write: '组织报告', finish: '返回有限结果',
+}
+const saveRun = () => { if (activeRun) localStorage.setItem(storageKey, JSON.stringify(activeRun)) }
+const safeUrl = (url?: string) => url?.startsWith('https://') || url?.startsWith('http://') ? url : undefined
 const starterPrompts = [
   {
     title: '深度调研',
@@ -157,6 +176,13 @@ const createNewChat = () => {
   progressLogs.value = []
   errorMessage.value = ''
   query.value = ''
+  threadId.value = crypto.randomUUID()
+  activeRun = null
+  runId.value = ''
+  runStatus.value = ''
+  runSummary.value = {}
+  runSources.value = []
+  localStorage.removeItem(storageKey)
 }
 
 const usePrompt = async (prompt: string) => {
@@ -183,88 +209,147 @@ const pushProgress = (message: string) => {
   }
 }
 
+const showProgress = (statusId: string) => {
+  const message = messages.value.find(m => m.id === statusId)
+  if (message) message.content = ['研究正在执行...', ...progressLogs.value].map(line => `- ${line}`).join('\n')
+}
+
+const applyResult = (result: RunResult, statusId: string) => {
+  runId.value = result.run_id
+  runStatus.value = result.status
+  runSummary.value = result.run_summary || {}
+  runSources.value = result.sources || []
+  messages.value = messages.value.filter(m => m.id !== statusId && m.id !== `a-${result.run_id}`)
+  messages.value.push({ id: `a-${result.run_id}`, role: 'assistant', content: result.final })
+  errorMessage.value = ''
+}
+
+const consume = async (response: Response, statusId: string): Promise<boolean> => {
+  if (!response.ok) throw new Error((await response.text()) || `请求失败: ${response.status}`)
+  if (!response.body) throw new Error('流式响应不可用')
+  const headerRun = response.headers.get('X-Research-Run-ID')
+  if (headerRun && activeRun) { activeRun.runId = headerRun; runId.value = headerRun; saveRun() }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = '', finished = false
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split(/\r?\n\r?\n/)
+      buffer = parts.pop() || ''
+      for (const part of parts) {
+        const data = part.split(/\r?\n/).find(line => line.startsWith('data: '))
+        if (!data) continue
+        const event = JSON.parse(data.slice(6)) as StreamEvent
+        if (event.run_id && activeRun) {
+          activeRun.runId = event.run_id
+          activeRun.seq = event.seq || activeRun.seq
+          runId.value = event.run_id
+          saveRun()
+        }
+        if (event.type === 'call_start' && event.kind === 'node') pushProgress(`开始：${nodeLabels[event.name || ''] || event.name}`)
+        if (event.type === 'phase') pushProgress(`完成：${nodeLabels[event.node || ''] || event.node}`)
+        if (event.type === 'warning') pushProgress(event.message || '执行出现问题，正在返回可用结果')
+        if (event.type === 'status') pushProgress(event.message || '研究已接收')
+        showProgress(statusId)
+        if (event.type === 'final') {
+          applyResult(event as RunResult, statusId)
+          finished = true
+        }
+      }
+      await scrollToBottom()
+    }
+  } finally { reader.releaseLock() }
+  return finished
+}
+
+const reconnect = async (statusId: string) => {
+  if (!activeRun?.runId) throw new Error('连接中断且未取得运行 ID；不会自动重复提交研究。')
+  let lastError: unknown
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(`/api/v1/research/runs/${activeRun.runId}`)
+      if (!response.ok) throw new Error(`运行查询失败: ${response.status}`)
+      const record = await response.json() as { status: string; result: RunResult | null }
+      if (record.status !== 'running' && record.result) { applyResult(record.result, statusId); return }
+      const events = await fetch(`/api/v1/research/runs/${activeRun.runId}/events?after_seq=${activeRun.seq}`)
+      if (await consume(events, statusId)) return
+    } catch (error) { lastError = error }
+    await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)))
+  }
+  throw lastError || new Error('连接暂不可用；研究可能仍在执行，可稍后点击重新连接。')
+}
+
+const reportError = (error: unknown, statusId: string) => {
+  errorMessage.value = error instanceof Error ? error.message : '请求失败'
+  messages.value = messages.value.filter(m => m.id !== statusId)
+}
+
 const runResearch = async () => {
   const userText = query.value.trim()
   if (!userText || loading.value) return
   loading.value = true
   errorMessage.value = ''
   progressLogs.value = []
+  runSummary.value = {}
+  runSources.value = []
+  runStatus.value = 'running'
+  runId.value = ''
   query.value = ''
+  activeRun = { runId: '', query: userText, seq: 0, userId: userId.value, threadId: threadId.value, tenantId: tenantId.value }
+  localStorage.removeItem(storageKey)
   messages.value.push({ id: `u-${Date.now()}`, role: 'user', content: userText })
   const statusId = `s-${Date.now()}`
-  messages.value.push({ id: statusId, role: 'status', content: '正在初始化执行链路...' })
-  const renderStatusText = () => {
-    const statusMessage = messages.value.find((item) => item.id === statusId)
-    if (!statusMessage) return
-    const latest = progressLogs.value.slice(-8)
-    statusMessage.content = ['正在处理中...', ...latest].map((line) => `- ${line}`).join('\n')
-  }
-  renderStatusText()
+  messages.value.push({ id: statusId, role: 'status', content: '正在提交研究...' })
   await scrollToBottom()
   try {
     const response = await fetch('/api/v1/research/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query: userText,
-        user_id: userId.value.trim() || 'default_user',
-        thread_id: threadId.value.trim() || 'default_thread',
-        tenant_id: tenantId.value.trim() || 'default_tenant',
-      }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: userText, user_id: userId.value.trim() || 'default_user',
+        thread_id: threadId.value.trim() || 'default_thread', tenant_id: tenantId.value.trim() || 'default_tenant',
+        max_iterations: 1, enable_memory: enableMemory.value }),
     })
-    if (!response.ok) {
-      const text = await response.text()
-      throw new Error(text || `请求失败: ${response.status}`)
-    }
-    if (!response.body) {
-      throw new Error('流式响应不可用')
-    }
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder('utf-8')
-    let buffer = ''
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const parts = buffer.split('\n\n')
-      buffer = parts.pop() || ''
-      for (const part of parts) {
-        if (!part.startsWith('data: ')) continue
-        const jsonText = part.slice(6).trim()
-        if (!jsonText) continue
-        const event = JSON.parse(jsonText) as StreamEvent
-        if (event.type === 'status' || event.type === 'phase' || event.type === 'route') {
-          const prefix = event.type === 'phase' && event.node ? `[${event.node}] ` : ''
-          pushProgress(`${prefix}${event.message || ''}`)
-          renderStatusText()
-        }
-        if (event.type === 'final') {
-          messages.value = messages.value.filter((item) => item.id !== statusId)
-          messages.value.push({
-            id: `a-${Date.now()}`,
-            role: 'assistant',
-            content: event.final || '已完成，但未返回正文。',
-          })
-        }
-        if (event.type === 'error') {
-          throw new Error(event.message || '服务端执行异常')
-        }
-      }
-      await scrollToBottom()
-    }
+    const acceptedRun = response.headers.get('X-Research-Run-ID')
+    if (acceptedRun && activeRun) { activeRun.runId = acceptedRun; runId.value = acceptedRun; saveRun() }
+    if (!await consume(response, statusId)) await reconnect(statusId)
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '请求失败'
-    messages.value = messages.value.filter((item) => item.id !== statusId)
-    messages.value.push({
-      id: `e-${Date.now()}`,
-      role: 'assistant',
-      content: `请求失败：${errorMessage.value}`,
-    })
-  } finally {
-    loading.value = false
-    await scrollToBottom()
-  }
+    if (activeRun?.runId) {
+      try { await reconnect(statusId) } catch (reconnectError) { reportError(reconnectError, statusId) }
+    } else { runStatus.value = ''; reportError(error, statusId) }
+  } finally { loading.value = false; await scrollToBottom() }
 }
+
+const reconnectLatest = async () => {
+  if (loading.value || !activeRun?.runId) return
+  loading.value = true
+  errorMessage.value = ''
+  const statusId = `s-${Date.now()}`
+  messages.value.push({ id: statusId, role: 'status', content: '正在读取运行记录，不会重新执行研究...' })
+  try { await reconnect(statusId) } catch (error) { reportError(error, statusId) }
+  finally { loading.value = false; await scrollToBottom() }
+}
+
+onMounted(async () => {
+  const saved = localStorage.getItem(storageKey)
+  if (!saved) return
+  try {
+    activeRun = JSON.parse(saved) as SavedRun
+    if (!activeRun || !/^[0-9a-f-]{36}$/i.test(activeRun.runId) || !Number.isInteger(activeRun.seq) || activeRun.seq < 0
+      || ![activeRun.query, activeRun.userId, activeRun.threadId, activeRun.tenantId].every(v => typeof v === 'string')) {
+      activeRun = null
+      localStorage.removeItem(storageKey)
+      return
+    }
+    runId.value = activeRun.runId
+    userId.value = activeRun.userId
+    threadId.value = activeRun.threadId
+    tenantId.value = activeRun.tenantId
+    messages.value.push({ id: `u-${activeRun.runId}`, role: 'user', content: activeRun.query })
+    await reconnectLatest()
+  } catch { localStorage.removeItem(storageKey) }
+})
 </script>
 
 <template>
@@ -276,7 +361,7 @@ const runResearch = async () => {
         <p class="brand-desc">多智能体研究工作台，支持快速回答与深度调研。</p>
       </div>
       <div class="sidebar-head">
-        <button class="new-chat-btn" @click="createNewChat">新建会话</button>
+        <button class="new-chat-btn" :disabled="loading" @click="createNewChat">新建会话</button>
       </div>
       <div class="quick-entry">
         <p class="section-title">推荐起手问题</p>
@@ -301,6 +386,7 @@ const runResearch = async () => {
         <label>Tenant ID</label>
         <input v-model="tenantId" class="sidebar-input" />
       </div>
+      <label class="memory-toggle"><input v-model="enableMemory" type="checkbox" />启用会话记忆（默认关闭）</label>
       <p class="hint-text">当前会话记忆键：{{ userId }} / {{ threadId }}</p>
     </aside>
 
@@ -308,7 +394,7 @@ const runResearch = async () => {
       <header class="main-header">
         <div>
           <h2>DeepResearch Enterprise Workspace</h2>
-          <p>面向业务团队的企业级智能研究台，支持从问题定义到结论落地的完整链路。</p>
+          <p>技术选型与资料研究：展示结论、证据与执行限制。网络来源基于搜索摘要。</p>
         </div>
         <div class="header-tags">
           <span>Evidence-Driven</span>
@@ -316,6 +402,26 @@ const runResearch = async () => {
           <span>Memory-Powered</span>
         </div>
       </header>
+      <details v-if="runId" class="run-details" open>
+        <summary>本次运行 · {{ statusLabels[runStatus] || '连接中' }}</summary>
+        <p>运行 ID：{{ runId }}</p>
+        <p v-if="runSummary.model_calls !== undefined">
+          模型调用 {{ runSummary.model_calls }} · 网络检索请求 {{ runSummary.web_calls }} · 工具调用 {{ runSummary.tool_calls }} ·
+          耗时 {{ ((runSummary.duration_ms || 0) / 1000).toFixed(1) }} 秒
+        </p>
+        <p v-if="runSummary.token_usage">已知 Token：输入 {{ runSummary.token_usage.input_tokens }} / 输出 {{ runSummary.token_usage.output_tokens }}（{{ runSummary.token_usage.status }}）</p>
+        <p v-if="runSummary.termination_reason">停止原因：{{ runSummary.termination_reason }}</p>
+        <p v-for="(error, index) in runSummary.errors || []" :key="index">{{ error.provider }} · {{ error.code }}：{{ error.message }}</p>
+        <button v-if="errorMessage && !loading" @click="reconnectLatest">重新连接本次运行</button>
+        <details v-if="runSources.length"><summary>查看报告引用的证据片段（{{ runSources.length }}）</summary>
+          <article v-for="source in runSources" :key="source.source_id" class="source-card">
+            <strong>[{{ source.source_id }}] {{ source.title }}</strong>
+            <p><a v-if="safeUrl(source.url)" :href="safeUrl(source.url)" target="_blank" rel="noreferrer">打开来源</a><span v-else>{{ source.doc_id }}</span>
+              · {{ source.retrieval_level === 'summary_only' ? '搜索摘要，未读取全文' : '本地资料片段' }}</p>
+            <p>{{ source.snippet }}</p>
+          </article>
+        </details>
+      </details>
       <div ref="messageListRef" class="message-list">
         <section v-if="messages.length <= 1" class="onboarding-panel">
           <div class="hero-panel">
@@ -391,3 +497,11 @@ const runResearch = async () => {
     </main>
   </div>
 </template>
+
+<style scoped>
+.run-details { margin: 0 24px 12px; padding: 12px 16px; border: 1px solid #dce4ee; border-radius: 12px; background: #f8fafc; max-height: 260px; overflow: auto; font-size: 13px; }
+.run-details p { margin: 6px 0; overflow-wrap: anywhere; }
+.run-details summary { cursor: pointer; font-weight: 600; }
+.source-card { margin-top: 10px; padding: 10px; background: white; border-radius: 8px; }
+.memory-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 12px 0; }
+</style>

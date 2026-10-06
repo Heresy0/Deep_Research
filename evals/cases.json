@@ -1,0 +1,12 @@
+[
+  {"id":"q01","query":"研究模拟方案 A 是否支持私有部署，并给出资料依据。","docs":["A"],"expected_quotes":["A 支持私有部署"],"keywords":["私有部署"]},
+  {"id":"q02","query":"对比模拟方案 A 与 B 的部署方式，只依据资料输出结论。","docs":["A","B"],"expected_quotes":["A 支持私有部署","B 仅支持公有云托管"],"keywords":["私有部署","公有云"]},
+  {"id":"q03","query":"研究 A 与 B 的开发集成方式，比较 SDK 与接口。","docs":["A","B"],"expected_quotes":["提供 Python SDK","B 提供 HTTP API"],"keywords":["Python","HTTP"]},
+  {"id":"q04","query":"研究方案 A 的许可与维护要求，不补充资料未说明的信息。","docs":["A"],"expected_quotes":["Apache-2.0 许可","自行维护应用服务和 PostgreSQL"],"keywords":["Apache","PostgreSQL"]},
+  {"id":"q05","query":"研究 B 的价格和超额费用，区分已知与未知。","docs":["B"],"expected_quotes":["每月 2000 元","超过套餐额度的费用没有在资料中说明"],"keywords":["2000","超"]},
+  {"id":"q06","query":"研究 B 的数据保留期，不推测合规结论。","docs":["B"],"expected_quotes":["B 的数据保留期为 30 天"],"keywords":["30"]},
+  {"id":"q07","query":"研究 C 的本地部署依赖与知识文档格式。","docs":["C"],"expected_quotes":["依赖 PostgreSQL 和 Milvus","UTF-8 Markdown 与 TXT"],"keywords":["PostgreSQL","Milvus","Markdown","TXT"]},
+  {"id":"q08","query":"研究 C 是否支持扫描件 OCR，只依据给定资料。","docs":["C"],"expected_quotes":["C 不支持 OCR"],"keywords":["不支持","OCR"]},
+  {"id":"q09","query":"研究 C 的限流与实际吞吐能力，不能把限流值当吞吐测试结果。","docs":["C"],"expected_quotes":["每分钟 60 个请求","资料没有提供并发吞吐测试"],"keywords":["60","吞吐"]},
+  {"id":"q10","query":"结合五人 Python 团队、私有部署与预算约束，对比 A 与 B 的适配性，指出仍需验证的成本。","docs":["A","B","TEAM"],"expected_quotes":["内部文档要求私有部署","预算是否包含服务器和模型费用"],"keywords":["私有部署","预算"]}
+]

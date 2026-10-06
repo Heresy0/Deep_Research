@@ -7,6 +7,11 @@ from langchain_core.messages import BaseMessage
 
 
 class ResearchState(TypedDict):
+    run_id: str
+    status: str
+    termination_reason: str
+    retrieval_errors: Annotated[list[dict], operator.add]
+    verified_findings: list[dict]
     query: str
     user_id: str
     tenant_id: str
@@ -52,8 +57,14 @@ def create_initial_state(
     user_id: str,
     tenant_id: str,
     memory_context: str = "",
+    run_id: str = "",
 ) -> ResearchState:
     return {
+        "run_id": run_id,
+        "status": "running",
+        "termination_reason": "",
+        "retrieval_errors": [],
+        "verified_findings": [],
         "query": query,
         "user_id": user_id,
         "tenant_id": tenant_id,

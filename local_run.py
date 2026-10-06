@@ -50,7 +50,11 @@ def main() -> None:
         # 初始化数据库表、checkpointer、Agent 图；不调用模型或搜索 API。
         from backend.service.workflow_service import WorkflowService
         service = WorkflowService(str(ROOT / "config.json"))
-        service._ensure_initialized()
+        try:
+            service.start()
+            service._ensure_initialized()
+        finally:
+            service.close()
         print("工作流初始化成功（未调用模型和搜索 API）")
     elif args.command == "backend":
         port = int(os.environ["PORT"])

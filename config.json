@@ -4,7 +4,7 @@
   "tenant_id": "default_tenant",
   "user_id": "default_user",
   "thread_id": "default",
-  "max_iterations": 3,
+  "max_iterations": 1,
   "enable_memory": true,
   "short_term_ttl_seconds": 604800,
   "short_term_max_messages": 30,

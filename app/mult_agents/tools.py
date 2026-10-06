@@ -6,6 +6,9 @@ import json
 import logging
 import operator
 import os
+import socket
+import time
+from contextlib import nullcontext
 from pathlib import Path
 import urllib.error
 import urllib.request
@@ -13,6 +16,7 @@ import urllib.request
 from langchain_core.tools import tool
 from typing import Optional
 from .rag.core import RAGSystem, RAGConfig
+from .harness.runtime import ExecutionError, current
 
 logger = logging.getLogger("mult_agents")
 
@@ -26,27 +30,37 @@ def init_rag_system(api_key: str, config: Optional[RAGConfig] = None):
         try:
             _RAG_SYSTEM = RAGSystem(api_key, config)
         except Exception as e:
-            print(f"RAG 系统初始化失败: {e}")
+            logger.warning("RAG 初始化失败 | exception_type=%s", type(e).__name__)
 
 
 def search_knowledge_base_records(query: str, limit: int = 5) -> list[dict]:
     if _RAG_SYSTEM is None:
-        return []
+        raise ExecutionError("RAG_UNAVAILABLE", "knowledge")
+    context = current()
+    if context:
+        context.reserve("local")
     try:
-        return _RAG_SYSTEM.search_records(query, k=limit)
-    except Exception:
-        return []
+        with context.span("tool", "search_knowledge") if context else nullcontext():
+            records = _RAG_SYSTEM.search_records(query, k=min(limit, 4))
+            if context:
+                context.emit({"type": "retrieval", "provider": "knowledge", "result_count": len(records)})
+            return records
+    except ExecutionError:
+        raise
+    except Exception as exc:
+        raise ExecutionError("RAG_UNAVAILABLE", "knowledge") from exc
 
 
 def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
     api_key = os.getenv("BOCHA_API_KEY", "").strip()
-    logger.info("[bocha_web_search] 开始搜索 | query=%s | count=%s", query, count)
-    logger.info("[bocha_web_search] API Key 状态 | 是否配置=%s | Key前缀=%s", bool(api_key), api_key[:8] + "..." if api_key else "None")
+    context = current()
+    if context and "bocha" in context.blocked_providers:
+        raise ExecutionError("AUTH_ERROR", "bocha")
     if not api_key:
-        logger.warning("[bocha_web_search] 未配置 BOCHA_API_KEY，跳过搜索")
-        return []
+        raise ExecutionError("AUTH_ERROR", "bocha")
+    count = max(1, min(count, 8))
     payload = {
-        "query": query,
+        "query": query[:500],
         "summary": True,
         "freshness": "noLimit",
         "count": count,
@@ -60,39 +74,47 @@ def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
             "Content-Type": "application/json",
         },
     )
-    try:
-        logger.info("[bocha_web_search] 发送请求 | url=%s", request.full_url)
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-            logger.info("[bocha_web_search] 收到响应 | status=%s | content_length=%s", response.status, len(raw))
-        result = json.loads(raw)
-        logger.info("[bocha_web_search] 解析响应成功 | data字段存在=%s", "data" in result)
-    except urllib.error.HTTPError as e:
-        logger.error("[bocha_web_search] HTTP 错误 | code=%s | reason=%s", e.code, e.reason)
-        return []
-    except urllib.error.URLError as e:
-        logger.error("[bocha_web_search] URL 错误 | reason=%s", e.reason)
-        return []
-    except json.JSONDecodeError as e:
-        logger.error("[bocha_web_search] JSON 解析错误 | error=%s", e)
-        return []
-    except Exception as e:
-        logger.error("[bocha_web_search] 未知错误 | error=%s | type=%s", e, type(e).__name__)
-        return []
-    data = result.get("data", {})
+    for attempt in range(3):
+        if context:
+            context.reserve("web")
+        try:
+            with context.span("tool", "search_web") if context else nullcontext():
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    raw = response.read(2_000_001)
+                if len(raw) > 2_000_000:
+                    raise ExecutionError("PARSE_ERROR", "bocha")
+                result = json.loads(raw.decode("utf-8"))
+                if not isinstance(result, dict) or not isinstance(result.get("data"), dict):
+                    raise ExecutionError("PARSE_ERROR", "bocha")
+            break
+        except ExecutionError:
+            raise
+        except urllib.error.HTTPError as exc:
+            code = "AUTH_ERROR" if exc.code in (401, 403) else "RATE_LIMIT" if exc.code == 429 else "NETWORK_ERROR" if exc.code >= 500 else "PARSE_ERROR"
+            error = ExecutionError(code, "bocha", exc.code == 429 or exc.code >= 500)
+        except (socket.timeout, TimeoutError):
+            error = ExecutionError("TIMEOUT", "bocha", True)
+        except urllib.error.URLError as exc:
+            code = "TIMEOUT" if isinstance(exc.reason, (socket.timeout, TimeoutError)) else "NETWORK_ERROR"
+            error = ExecutionError(code, "bocha", True)
+        except (json.JSONDecodeError, UnicodeError):
+            raise ExecutionError("PARSE_ERROR", "bocha")
+        if not error.retryable or attempt == 2:
+            raise error
+        if context:
+            context.emit({"type": "retry", "provider": "bocha", "code": error.code, "attempt": attempt + 1})
+        time.sleep(.1 * (attempt + 1))
+    data = result["data"]
     pages = data.get("webPages", [])
-    logger.info("[bocha_web_search] 解析数据 | webPages类型=%s", type(pages).__name__)
     if isinstance(pages, dict):
         if isinstance(pages.get("value"), list):
             pages = pages.get("value", [])
         elif isinstance(pages.get("items"), list):
             pages = pages.get("items", [])
         else:
-            pages = []
+            raise ExecutionError("PARSE_ERROR", "bocha")
     if not isinstance(pages, list):
-        logger.warning("[bocha_web_search] webPages 格式异常 | type=%s", type(pages).__name__)
-        return []
-    logger.info("[bocha_web_search] 获取网页数量 | total=%s", len(pages))
+        raise ExecutionError("PARSE_ERROR", "bocha")
     records: list[dict] = []
     for idx, page in enumerate(pages[:count], 1):
         if not isinstance(page, dict):
@@ -103,8 +125,7 @@ def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
         if "://" in url:
             domain = url.split("://", 1)[1].split("/", 1)[0]
         title = page.get("name") or f"web_result_{idx}"
-        snippet = page.get("summary") or ""
-        logger.info("[bocha_web_search] 解析记录 %s | title=%s | url=%s | snippet长度=%s", idx, title[:50], domain, len(snippet))
+        snippet = str(page.get("summary") or "")[:1800]
         records.append(
             {
                 "source_id": f"WEB-{idx}",
@@ -113,10 +134,12 @@ def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
                 "snippet": snippet,
                 "domain": domain,
                 "source_type": "web",
+                "retrieval_level": "summary_only",
                 "published_at": page.get("datePublished") or page.get("dateLastCrawled") or "",
             }
         )
-    logger.info("[bocha_web_search] 搜索完成 | 返回记录数=%s", len(records))
+    if context:
+        context.emit({"type": "retrieval", "provider": "bocha", "result_count": len(records), "retrieval_level": "summary_only"})
     return records
 
 @tool

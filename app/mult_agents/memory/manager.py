@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from langchain_community.chat_models import ChatTongyi
-from langchain_community.embeddings import DashScopeEmbeddings
+from ..harness.embeddings import build_embeddings
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
@@ -19,6 +19,7 @@ from .base import MemoryEntry, MemoryType
 from .long_term import EpisodicMemoryStore, SemanticMemoryStore
 from .short_term import ShortTermMemory
 from .utils import extract_memory_from_messages, format_memories_for_prompt, merge_user_profile
+from ..harness.runtime import invoke_chat_model
 
 try:
     import redis
@@ -120,7 +121,7 @@ class MemoryManager:
         if not self._postgres_dsn or psycopg is None:
             return
         try:
-            with psycopg.connect(self._postgres_dsn) as conn:
+            with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
                 with conn.cursor() as cur:
                     if self.enable_long_term and self.long_term_backend == "postgres":
                         cur.execute(
@@ -205,10 +206,7 @@ class MemoryManager:
         if not milvus_host or not embedding_api_key:
             return
         try:
-            embeddings = DashScopeEmbeddings(
-                model=embedding_model,
-                dashscope_api_key=embedding_api_key,
-            )
+            embeddings = build_embeddings(embedding_model, embedding_api_key)
             self._milvus_store = MilvusVectorStore(
                 embedding_function=embeddings,
                 collection_name=milvus_collection,
@@ -223,7 +221,8 @@ class MemoryManager:
         if not api_key:
             return
         try:
-            self._summary_llm = ChatTongyi(model=summary_model, temperature=0.1, dashscope_api_key=api_key)
+            self._summary_llm = ChatTongyi(model=summary_model, temperature=0.1, dashscope_api_key=api_key,
+                                           max_retries=1, model_kwargs={"max_tokens": 1200, "request_timeout": 30})
         except Exception as exc:
             logger.warning("摘要模型初始化失败，降级规则压缩: %s", exc)
             self._summary_llm = None
@@ -267,7 +266,7 @@ class MemoryManager:
             f"{history_text}\n"
             "输出要求：100-300字，中文，结构紧凑。"
         )
-        response = self._summary_llm.invoke([HumanMessage(content=prompt)])
+        response = invoke_chat_model(self._summary_llm, [HumanMessage(content=prompt)], "memory_summary", terminal=True)
         return str(response.content).strip()
 
     def _compress_redis_thread(self, tenant_id: str, user_id: str, thread_id: str) -> None:
@@ -295,7 +294,7 @@ class MemoryManager:
     def _save_pg_short_term_message(self, tenant_id: str, user_id: str, thread_id: str, payload: Dict[str, str]) -> None:
         if not self._postgres_dsn or psycopg is None:
             return
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -317,7 +316,7 @@ class MemoryManager:
     def _get_pg_short_term_messages(self, tenant_id: str, user_id: str, thread_id: str) -> List[Dict[str, str]]:
         if not self._postgres_dsn or psycopg is None:
             return []
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -334,7 +333,7 @@ class MemoryManager:
     def _set_pg_short_term_summary(self, tenant_id: str, user_id: str, thread_id: str, summary: str) -> None:
         if not self._postgres_dsn or psycopg is None:
             return
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -350,7 +349,7 @@ class MemoryManager:
     def _get_pg_short_term_summary(self, tenant_id: str, user_id: str, thread_id: str) -> str:
         if not self._postgres_dsn or psycopg is None:
             return ""
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -374,7 +373,7 @@ class MemoryManager:
         keep_messages = history[split_at:]
         existing_summary = self._get_pg_short_term_summary(tenant_id, user_id, thread_id)
         new_summary = self._summarize_text(existing_summary, to_summarize)
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -405,7 +404,7 @@ class MemoryManager:
     def _upsert_profile_pg(self, tenant_id: str, user_id: str, profile: Dict[str, Any]) -> None:
         if not self._postgres_dsn or psycopg is None:
             return
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -421,7 +420,7 @@ class MemoryManager:
     def _insert_memory_pg(self, entry: MemoryEntry, summary: str = "") -> None:
         if not self._postgres_dsn or psycopg is None:
             return
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -631,7 +630,7 @@ class MemoryManager:
             if summary_keys:
                 self._redis_client.delete(*summary_keys)
         if self.short_term_backend == "postgres" and self._postgres_dsn and psycopg:
-            with psycopg.connect(self._postgres_dsn) as conn:
+            with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM short_term_messages WHERE thread_id = %s", (thread_id,))
                     cur.execute("DELETE FROM short_term_summaries WHERE thread_id = %s", (thread_id,))
@@ -645,7 +644,7 @@ class MemoryManager:
             if threads:
                 return sorted(threads)
         if self.short_term_backend == "postgres" and self._postgres_dsn and psycopg:
-            with psycopg.connect(self._postgres_dsn) as conn:
+            with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT DISTINCT thread_id FROM short_term_messages")
                     rows = cur.fetchall()
@@ -701,7 +700,7 @@ class MemoryManager:
             return None
         tenant = tenant_id or self.default_tenant_id
         if self.long_term_backend == "postgres" and self._postgres_dsn and psycopg:
-            with psycopg.connect(self._postgres_dsn) as conn:
+            with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT profile FROM user_profiles WHERE tenant_id = %s AND user_id = %s",
@@ -763,7 +762,7 @@ class MemoryManager:
         if not self._milvus_store:
             return []
         try:
-            docs = self._milvus_store.similarity_search(query, k=max(limit * 4, 20))
+            docs = self._milvus_store.similarity_search(query, k=max(limit * 4, 20), timeout=10)
             logger.info(
                 "[memory] milvus search raw | tenant=%s user=%s thread=%s query=%s raw_hits=%d",
                 tenant_id,
@@ -883,7 +882,7 @@ class MemoryManager:
             params.append(thread_id)
         sql += " ORDER BY created_at DESC LIMIT %s"
         params.append(limit)
-        with psycopg.connect(self._postgres_dsn) as conn:
+        with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
@@ -1439,7 +1438,7 @@ class MemoryManager:
                 if keys:
                     self._redis_client.delete(*keys)
             if self.short_term_backend == "postgres" and self._postgres_dsn and psycopg:
-                with psycopg.connect(self._postgres_dsn) as conn:
+                with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
                     with conn.cursor() as cur:
                         cur.execute(
                             "DELETE FROM short_term_messages WHERE tenant_id = %s AND user_id = %s",
@@ -1452,7 +1451,7 @@ class MemoryManager:
                         conn.commit()
             results["short_term"] = len(keys)
         if self.long_term_backend == "postgres" and self._postgres_dsn and psycopg:
-            with psycopg.connect(self._postgres_dsn) as conn:
+            with psycopg.connect(self._postgres_dsn, connect_timeout=5, options="-c statement_timeout=10000") as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "DELETE FROM memory_entries WHERE tenant_id = %s AND user_id = %s",
